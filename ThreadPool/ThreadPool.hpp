@@ -48,7 +48,7 @@ public:
     -> std::future<typename std::result_of<F(Args...)>::type>{
         // 组装任务包
         using return_type = typename std::result_of<F(Args...)>::type;
-
+        // packaged_task本身只是一个可调用的对象，无论是本线程还是其他线程，都是可以调用的
         auto task = std::make_shared<std::packaged_task<return_type()>>
                     (std::bind(std::forward<F>(f), std::forward<Args>(args)...));
         std::future<return_type> res = task->get_future();
