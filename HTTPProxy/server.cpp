@@ -44,6 +44,7 @@ bool check_authentication(const std::string& username, const std::string& pwd){
 
 }
 
+// AuthConnection负责验证连接
 class AuthConnection: public boost::enable_shared_from_this<AuthConnection>
 {
 public:
@@ -58,7 +59,7 @@ public:
   {
     return m_socket;
   }
-
+  // 被调用的工作方法
   void authenticate()
   {
     m_socket.async_read_some(boost::asio::buffer(m_readBuf), 
@@ -123,6 +124,7 @@ private:
   boost::array<char, 256> m_readBuf;
 };
 
+// 验证服务器类，负责监听和生成验证连接类
 class AuthServer{
 private:
     boost::asio::io_context& m_io;
@@ -149,9 +151,12 @@ public:
     }
 };
 
+// 数据连接类，负责单个接入点的数据处理
 class DataConnection: public boost::enable_shared_from_this<DataConnection>{
 private:
+    std::string method;
     std::string http;
+    std::string firstHeader;
     boost::asio::io_context& m_io;
     boost::asio::ip::tcp::socket m_socket;
     boost::asio::ip::tcp::socket m_dataSocket; // 该套接字对外联络
@@ -192,37 +197,53 @@ public:
         std::cout.write(m_buffer.data(), bytes);
         
         // 获取连接信息
-        std::string connInfo;
         for(size_t i=0; i<bytes; i++)
-            connInfo.push_back(m_buffer[i]);
+            firstHeader.push_back(m_buffer[i]);
         // 切割字符串，提取\r\n
-        std::vector<std::string> res;
-        boost::split_regex(res, connInfo, boost::regex("\r\n"));
-
-        std::vector<std::string> firstLine;
-        boost::split(firstLine, res.at(0), boost::is_any_of(" "), boost::token_compress_on);
-        http = firstLine.at(2);
+        std::vector<std::string> lines;
+        boost::split_regex(lines, firstHeader, boost::regex("\r\n"));
+        // 分解第一行
+        std::vector<std::string> firstLineParts;
+        boost::split(firstLineParts, lines[0], boost::is_any_of(" "), boost::token_compress_on);
+        method = firstLineParts[0];
+        http = firstLineParts[2];
 
         // 提取host:
-        std::string host;
-        for(const std::string& arg: res){
-            if(arg.find("Host: ")==0){
+        std::string host, port;
+        for(const std::string& line: lines){
+            if(line.find("Host: ")==0){
                 std::vector<std::string> resolve;
-                boost::split(resolve, arg, boost::is_any_of(": /"), boost::token_compress_on);
+                boost::split(resolve, line, boost::is_any_of(": /"), boost::token_compress_on);
                 host = resolve.at(1);
+                // 下面尝试转换可能存在的端口号
+                try{
+                    boost::lexical_cast<unsigned short>(resolve.back());
+                    port = resolve.back();
+                }catch(const std::exception& e){
+
+                }
+
                 break;
             }
         }
-
         if(host.empty())
             handle_host_empty(http);
         // 提取port
         std::vector<std::string> resolve;
-        boost::split(resolve, firstLine[1], boost::is_any_of(":/"), boost::token_compress_on);
-        std::string port = resolve.back();
+        boost::split(resolve, firstLineParts[1], boost::is_any_of(":/"), boost::token_compress_on);
+        try{
+            boost::lexical_cast<unsigned short>(resolve.back());
+            port = resolve.back();
+        }catch(std::exception& e){
 
+        }
+        
         // 调试信息
         std::cout<<host<<'\t'<<port<<'\n';
+
+        // 默认端口号为80
+        if(port.empty())
+            port = "80";
 
         // 转换地址
         m_resolver.async_resolve(host, port, 
@@ -232,7 +253,7 @@ public:
                                             boost::asio::placeholders::results)
                                 );
     }
-
+    // 这个函数处理域名为空的情况
     void handle_host_empty(std::string s)
     {
         std::string response(s);
@@ -245,7 +266,7 @@ public:
                                             boost::asio::placeholders::bytes_transferred)
                                 );
     }
-
+    // 解析完域名后的回调函数
     void handle_after_resolve(const boost::system::error_code& e, boost::asio::ip::tcp::resolver::results_type results)
     {
         if(e){
@@ -253,73 +274,92 @@ public:
             std::cout<<e.message()<<'\n';
             return;
         }
+
         m_dataSocket.async_connect(*results.begin(), 
                                     boost::bind(&DataConnection::handle_after_connect, 
                                                 shared_from_this(),
                                                 boost::asio::placeholders::error)
                                     );
     }
-
+    // 连接上服务器后的回调函数
     void handle_after_connect(const boost::system::error_code& e)
     {
-        // 向客户端发送连接成功
-        std::string response(http);
-        response += " 200 OK\r\n\r\n";
-        boost::asio::async_write(m_socket, 
-                                boost::asio::buffer(response), 
-                                boost::bind(&DataConnection::transfer_data, 
-                                            shared_from_this(),
-                                            boost::asio::placeholders::error,
-                                            boost::asio::placeholders::bytes_transferred)
-                                );
-    }
+        if(e){
+            std::cout<<"error met!"<<'\n';
+            std::cout<<e.message()<<'\n';
+            return;
+        }
 
+        if(method != "CONNECT"){
+            // 如果不是CONNECT方法，直接转发，不要向客户端发送回执
+            boost::asio::async_write(m_dataSocket, 
+                                    boost::asio::buffer(firstHeader),
+                                    boost::bind(&DataConnection::transfer_data, 
+                                                shared_from_this(),
+                                                boost::asio::placeholders::error,
+                                                boost::asio::placeholders::bytes_transferred)
+                                    );
+        }
+        else{
+            // CONNECT方法，向客户端发送连接成功
+            std::string response(http);
+            response += " 200 OK\r\n\r\n";
+            boost::asio::async_write(m_socket, 
+                                    boost::asio::buffer(response), 
+                                    boost::bind(&DataConnection::transfer_data, 
+                                                shared_from_this(),
+                                                boost::asio::placeholders::error,
+                                                boost::asio::placeholders::bytes_transferred)
+                                    );
+        }
+    }
+    // 负责数据转发，调用两个单方向的转发函数
     void transfer_data(const boost::system::error_code& e, size_t bytes) 
     {
         // 调试信息
         std::cout<<"开始数据转发\n";
 
-        client2outer();
-        outer2client();
+        client2server();
+        server2client();
     }
-
-    void client2outer()
+    // 客户端到服务器的读取函数
+    void client2server()
     {
         m_socket.async_read_some(boost::asio::buffer(m_buffer),
-                                boost::bind(&DataConnection::handle_client2outer, 
+                                boost::bind(&DataConnection::handle_client2server, 
                                             shared_from_this(),
                                             boost::asio::placeholders::error,
                                             boost::asio::placeholders::bytes_transferred)
                                 );
     }
-
-    void handle_client2outer(const boost::system::error_code& e, size_t bytes)
+    // 客户端到服务器的转发函数
+    void handle_client2server(const boost::system::error_code& e, size_t bytes)
     {
         auto ptr = shared_from_this();
         boost::asio::async_write(m_dataSocket,
                                 boost::asio::buffer(m_buffer, bytes),
                                 [ptr](const boost::system::error_code& e, size_t bytes)
-                                {ptr->client2outer();}
+                                {ptr->client2server();}
                                 );
     }
-
-    void outer2client()
+    // 服务端到客户端的读取函数
+    void server2client()
     {
         m_dataSocket.async_read_some(boost::asio::buffer(m_outerBuffer),
-                                    boost::bind(&DataConnection::handle_outer2client, 
+                                    boost::bind(&DataConnection::handle_server2client, 
                                                 shared_from_this(),
                                                 boost::asio::placeholders::error,
                                                 boost::asio::placeholders::bytes_transferred)
                                     );
     }
-
-    void handle_outer2client(const boost::system::error_code& e, size_t bytes)
+    // 服务端到客户端的转发函数
+    void handle_server2client(const boost::system::error_code& e, size_t bytes)
     {
         auto ptr = shared_from_this();
         boost::asio::async_write(m_socket,
                                 boost::asio::buffer(m_outerBuffer, bytes),
                                 [ptr](const boost::system::error_code& e, size_t bytes)
-                                {ptr->outer2client();}
+                                {ptr->server2client();}
                                 );
     }
 
