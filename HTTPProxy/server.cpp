@@ -6,7 +6,6 @@
 #include <boost/regex.hpp>
 #include <boost/algorithm/string/regex.hpp>
 #include <boost/asio.hpp>
-#include <boost/asio/query.hpp>
 #include <boost/lexical_cast.hpp>
 #include <vector>
 #include <iostream>
@@ -162,7 +161,7 @@ private:
     boost::asio::ip::tcp::socket m_dataSocket; // 该套接字对外联络
     boost::asio::ip::tcp::resolver m_resolver;
     boost::array<char, 2048> m_buffer;
-    boost::array<char, 2048> m_outerBuffer;
+    boost::array<char, 2048> m_serverBuffer;
 
     explicit DataConnection(boost::asio::io_context& io):m_io(io), m_socket(io), m_dataSocket(io), m_resolver(io) {}
 
@@ -316,6 +315,11 @@ public:
     // 负责数据转发，调用两个单方向的转发函数
     void transfer_data(const boost::system::error_code& e, size_t bytes) 
     {
+        if(e){
+            std::cout<<"error met!"<<'\n';
+            std::cout<<e.message()<<'\n';
+            return;
+        }
         // 调试信息
         std::cout<<"开始数据转发\n";
 
@@ -335,17 +339,32 @@ public:
     // 客户端到服务器的转发函数
     void handle_client2server(const boost::system::error_code& e, size_t bytes)
     {
+        if(e && e != boost::asio::error::misc_errors::eof){
+            // 其他类型的错误直接返回
+            std::cout<<"error met!"<<'\n';
+            std::cout<<e.message()<<'\n';
+            boost::asio::async_write(m_dataSocket,
+                                    boost::asio::buffer(m_buffer, bytes),
+                                    boost::bind(&DataConnection::void_write, 
+                                                shared_from_this(),
+                                                boost::asio::placeholders::error,
+                                                boost::asio::placeholders::bytes_transferred)
+                                    );
+            return;
+        }
+        // 正常情况
         auto ptr = shared_from_this();
         boost::asio::async_write(m_dataSocket,
                                 boost::asio::buffer(m_buffer, bytes),
                                 [ptr](const boost::system::error_code& e, size_t bytes)
                                 {ptr->client2server();}
                                 );
+        
     }
     // 服务端到客户端的读取函数
     void server2client()
     {
-        m_dataSocket.async_read_some(boost::asio::buffer(m_outerBuffer),
+        m_dataSocket.async_read_some(boost::asio::buffer(m_serverBuffer),
                                     boost::bind(&DataConnection::handle_server2client, 
                                                 shared_from_this(),
                                                 boost::asio::placeholders::error,
@@ -355,15 +374,40 @@ public:
     // 服务端到客户端的转发函数
     void handle_server2client(const boost::system::error_code& e, size_t bytes)
     {
+        if(e && e != boost::asio::error::misc_errors::eof){
+            std::cout<<"error met!"<<'\n';
+            std::cout<<e.message()<<'\n';
+            boost::asio::async_write(m_socket,
+                                    boost::asio::buffer(m_serverBuffer, bytes),
+                                    boost::bind(&DataConnection::void_write, 
+                                                shared_from_this(),
+                                                boost::asio::placeholders::error,
+                                                boost::asio::placeholders::bytes_transferred)
+                                );
+            return;
+        }
         auto ptr = shared_from_this();
         boost::asio::async_write(m_socket,
-                                boost::asio::buffer(m_outerBuffer, bytes),
+                                boost::asio::buffer(m_serverBuffer, bytes),
                                 [ptr](const boost::system::error_code& e, size_t bytes)
                                 {ptr->server2client();}
                                 );
+        
     }
 
     void void_write(const boost::system::error_code& e, size_t bytes)  {}
+
+    ~DataConnection()
+    {
+        try{
+            m_socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both);
+            m_socket.close();
+            m_dataSocket.shutdown(boost::asio::ip::tcp::socket::shutdown_both);
+            m_dataSocket.close();
+        }catch(std::exception& e){
+            
+        }
+    }
 };
 
 class DataServer{
@@ -398,12 +442,12 @@ public:
 int main(){
     try{
         global::init();
-        global::secretPort=36951;
         std::cout<<global::secretPort<<'\n';
     
         boost::asio::io_context io;
         AuthServer authServer(io, global::port);
         DataServer dataServer(io, global::secretPort);
+        std::cout<<global::secretPort<<'\n';
         io.run();
     }catch(const std::exception& e){
         std::cerr<<e.what()<<'\n';
